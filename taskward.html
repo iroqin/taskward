@@ -1,0 +1,672 @@
+import React, { useState, useEffect } from 'react';
+import { CheckCircle2, Circle, Plus, List, Settings, RotateCcw, Menu, X, Check, Lock, User as UserIcon } from 'lucide-react';
+import { initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously, onAuthStateChanged, signInWithCustomToken } from 'firebase/auth';
+import { getFirestore, doc, setDoc, onSnapshot, collection } from 'firebase/firestore';
+
+// ======= 1. MASUKKAN CONFIG FIREBASE ANDA DI SINI =======
+// Ganti nilai-nilai di bawah ini dengan config dari pengaturan Firebase Console Anda
+const myFirebaseConfig = {
+  apiKey: "API_KEY_ANDA",
+  authDomain: "PROJECT_ID.firebaseapp.com",
+  projectId: "PROJECT_ID",
+  storageBucket: "PROJECT_ID.firebasestorage.app",
+  messagingSenderId: "SENDER_ID",
+  appId: "APP_ID"
+};
+
+// ======= 2. PENGATURAN KONEKSI =======
+const firebaseConfig = typeof __firebase_config !== 'undefined' && Object.keys(JSON.parse(__firebase_config)).length > 0 
+  ? JSON.parse(__firebase_config) 
+  : myFirebaseConfig;
+
+const app = Object.keys(firebaseConfig).length > 0 && firebaseConfig.apiKey !== "API_KEY_ANDA" ? initializeApp(firebaseConfig) : null;
+const auth = app ? getAuth(app) : null;
+const db = app ? getFirestore(app) : null;
+const appId = typeof __app_id !== 'undefined' ? __app_id : 'checklist-keluarga-app';
+
+const PRIORITIES = {
+  RENDAH: { label: 'Rendah', color: 'bg-green-100 text-green-800 border-green-200' },
+  BIASA: { label: 'Biasa', color: 'bg-blue-100 text-blue-800 border-blue-200' },
+  TINGGI: { label: 'Tinggi', color: 'bg-orange-100 text-orange-800 border-orange-200' },
+  BUTUH: { label: 'Sangat Butuh', color: 'bg-red-100 text-red-800 border-red-200' }
+};
+
+const DEFAULT_USERS = {
+  'user1': { id: 'user1', name: 'Abi', pin: '4444' },
+  'user2': { id: 'user2', name: 'Umi', pin: '3333' },
+  'user3': { id: 'user3', name: 'Kaivan', pin: '2222' },
+  'user4': { id: 'user4', name: 'Zafira', pin: '1111' },
+};
+
+export default function App() {
+  const [firebaseUser, setFirebaseUser] = useState(null);
+  
+  // State untuk Aplikasi (Login & Navigation)
+  const [activeTab, setActiveTab] = useState('today');
+  const [currentUser, setCurrentUser] = useState(null); // id user yang sedang login
+  const [users, setUsers] = useState(DEFAULT_USERS);
+  const [isSidebarOpen, setIsSidebarOpen] = useState(true);
+  
+  // State untuk Data Tasks per User
+  const [tasks, setTasks] = useState({});
+  const [history, setHistory] = useState({});
+  
+  // State untuk Form Add
+  const [isAdding, setIsAdding] = useState(false);
+  const [newTaskType, setNewTaskType] = useState('task');
+  const [newTaskTitle, setNewTaskTitle] = useState('');
+  const [newTaskPriority, setNewTaskPriority] = useState('BIASA');
+  const [newTaskDays, setNewTaskDays] = useState([]);
+
+  // State untuk Login
+  const [loginStep, setLoginStep] = useState('select'); // 'select' | 'pin'
+  const [selectedUserId, setSelectedUserId] = useState(null);
+  const [pinInput, setPinInput] = useState('');
+  const [loginError, setLoginError] = useState('');
+
+  // State untuk Settings
+  const [editName, setEditName] = useState('');
+  const [editPin, setEditPin] = useState('');
+  const [settingsMessage, setSettingsMessage] = useState('');
+
+  useEffect(() => {
+    // 1. Firebase Auth
+    if (auth) {
+      const initAuth = async () => {
+        try {
+          if (typeof __initial_auth_token !== 'undefined' && __initial_auth_token) {
+            await signInWithCustomToken(auth, __initial_auth_token);
+          } else {
+            await signInAnonymously(auth);
+          }
+        } catch (error) {
+          console.error("Auth error:", error);
+        }
+      };
+      initAuth();
+      const unsubscribe = onAuthStateChanged(auth, setFirebaseUser);
+      return () => unsubscribe();
+    }
+  }, []);
+
+  useEffect(() => {
+    // 2. Load Local Storage Data
+    const savedUsers = localStorage.getItem('checklist_users');
+    if (savedUsers) {
+      setUsers(JSON.parse(savedUsers));
+    } else {
+      localStorage.setItem('checklist_users', JSON.stringify(DEFAULT_USERS));
+    }
+
+    const savedTasks = localStorage.getItem('checklist_tasks');
+    if (savedTasks) setTasks(JSON.parse(savedTasks));
+
+    const savedHistory = localStorage.getItem('checklist_history');
+    if (savedHistory) setHistory(JSON.parse(savedHistory));
+  }, []);
+
+  // Sync ke Firebase jika terhubung
+  useEffect(() => {
+    if (!firebaseUser || !db || !currentUser) return;
+    
+    const syncDataToFirebase = async () => {
+        try {
+            const userDocRef = doc(db, 'artifacts', appId, 'users', firebaseUser.uid, 'data', currentUser);
+            await setDoc(userDocRef, {
+                tasks: tasks[currentUser] || [],
+                history: history[currentUser] || [],
+                profile: users[currentUser]
+            }, { merge: true });
+        } catch (error) {
+            console.error("Firebase sync error:", error);
+        }
+    };
+    
+    syncDataToFirebase();
+  }, [tasks, history, users, currentUser, firebaseUser, db]);
+
+  const getTodayIndex = () => {
+    const day = new Date().getDay();
+    return day === 0 ? 6 : day - 1; // 0=Senin, 6=Minggu
+  };
+
+  const handleLoginClick = (userId) => {
+    setSelectedUserId(userId);
+    setLoginStep('pin');
+    setPinInput('');
+    setLoginError('');
+  };
+
+  const handlePinSubmit = (e) => {
+    e.preventDefault();
+    if (users[selectedUserId].pin === pinInput) {
+      setCurrentUser(selectedUserId);
+      setEditName(users[selectedUserId].name);
+      setEditPin(users[selectedUserId].pin);
+      
+      // Reset daily tasks untuk hari ini
+      resetDailyTasks(selectedUserId);
+    } else {
+      setLoginError('Password salah!');
+    }
+  };
+
+  const handleLogout = () => {
+    setCurrentUser(null);
+    setLoginStep('select');
+    setSelectedUserId(null);
+    setActiveTab('today');
+  };
+
+  const handleSaveSettings = () => {
+    if (editName.trim() === '') return;
+    
+    const updatedUsers = {
+      ...users,
+      [currentUser]: {
+        ...users[currentUser],
+        name: editName,
+        pin: editPin || '00000000'
+      }
+    };
+    
+    setUsers(updatedUsers);
+    localStorage.setItem('checklist_users', JSON.stringify(updatedUsers));
+    setSettingsMessage('Perubahan berhasil disimpan!');
+    setTimeout(() => setSettingsMessage(''), 3000);
+  };
+
+  const resetDailyTasks = (userId) => {
+    const userTasks = tasks[userId] || [];
+    const todayStr = new Date().toDateString();
+    
+    let isUpdated = false;
+    const updatedTasks = userTasks.map(task => {
+      if (task.type === 'routine' && task.lastReset !== todayStr) {
+        isUpdated = true;
+        return { ...task, isCompleted: false, lastReset: todayStr };
+      }
+      return task;
+    });
+
+    if (isUpdated) {
+      const newTasks = { ...tasks, [userId]: updatedTasks };
+      setTasks(newTasks);
+      localStorage.setItem('checklist_tasks', JSON.stringify(newTasks));
+    }
+  };
+
+  const handleAddTask = () => {
+    if (!newTaskTitle.trim() || !currentUser) return;
+
+    const newTask = {
+      id: Date.now().toString(),
+      title: newTaskTitle,
+      type: newTaskType,
+      priority: newTaskPriority,
+      isCompleted: false,
+      createdAt: new Date().toISOString(),
+      ...(newTaskType === 'routine' && { 
+        days: newTaskDays.length > 0 ? newTaskDays : [0,1,2,3,4,5,6],
+        lastReset: new Date().toDateString()
+      })
+    };
+
+    const userTasks = tasks[currentUser] || [];
+    const newTasksState = {
+      ...tasks,
+      [currentUser]: [...userTasks, newTask]
+    };
+
+    setTasks(newTasksState);
+    localStorage.setItem('checklist_tasks', JSON.stringify(newTasksState));
+
+    setIsAdding(false);
+    setNewTaskTitle('');
+    setNewTaskDays([]);
+    setNewTaskPriority('BIASA');
+  };
+
+  const toggleTaskCompletion = (taskId, isCompletedNow) => {
+    const userTasks = tasks[currentUser] || [];
+    const userHistory = history[currentUser] || [];
+    
+    const taskIndex = userTasks.findIndex(t => t.id === taskId);
+    if (taskIndex === -1) return;
+
+    const task = userTasks[taskIndex];
+    let updatedTasks = [...userTasks];
+    let updatedHistory = [...userHistory];
+
+    if (!isCompletedNow) {
+      // Tandai Selesai
+      updatedTasks[taskIndex] = { ...task, isCompleted: true };
+      
+      updatedHistory.unshift({
+        ...task,
+        historyId: Date.now().toString(),
+        completedAt: new Date().toISOString()
+      });
+
+      // Jika task one-off, hapus dari list utama
+      if (task.type === 'task') {
+        updatedTasks = updatedTasks.filter(t => t.id !== taskId);
+      }
+    } else {
+      // Batal Selesai (Hanya mungkin dari Tab Hari Ini untuk Routine)
+      updatedTasks[taskIndex] = { ...task, isCompleted: false };
+      
+      // Cari dan hapus dari history teratas (paling baru)
+      const historyIndex = updatedHistory.findIndex(h => h.id === taskId);
+      if (historyIndex !== -1) {
+        updatedHistory.splice(historyIndex, 1);
+      }
+    }
+
+    const newTasksState = { ...tasks, [currentUser]: updatedTasks };
+    const newHistoryState = { ...history, [currentUser]: updatedHistory };
+
+    setTasks(newTasksState);
+    setHistory(newHistoryState);
+    
+    localStorage.setItem('checklist_tasks', JSON.stringify(newTasksState));
+    localStorage.setItem('checklist_history', JSON.stringify(newHistoryState));
+  };
+
+  const userTasks = tasks[currentUser] || [];
+  const userHistory = history[currentUser] || [];
+
+  const getFilteredTasks = () => {
+    const todayIndex = getTodayIndex();
+    
+    if (activeTab === 'today') {
+      return userTasks.filter(task => {
+        if (task.type === 'task') return true;
+        if (task.type === 'routine') return task.days.includes(todayIndex);
+        return false;
+      });
+    }
+    
+    if (activeTab === 'routines') {
+      return userTasks.filter(task => task.type === 'routine');
+    }
+
+    return [];
+  };
+
+  if (!currentUser) {
+    return (
+      <div className="min-h-screen bg-slate-50 flex items-center justify-center p-4 font-sans text-slate-800">
+        <div className="max-w-md w-full bg-white rounded-2xl shadow-xl overflow-hidden">
+          <div className="bg-indigo-600 p-6 text-center text-white">
+            <h1 className="text-2xl font-bold">Checklist Keluarga</h1>
+            <p className="opacity-80 text-sm mt-1">Pilih profil Anda untuk mulai</p>
+          </div>
+
+          <div className="p-6">
+            {loginStep === 'select' ? (
+              <div className="grid grid-cols-2 gap-4">
+                {Object.values(users).map((user) => (
+                  <button
+                    key={user.id}
+                    onClick={() => handleLoginClick(user.id)}
+                    className="flex flex-col items-center justify-center p-6 border-2 border-slate-100 rounded-xl hover:border-indigo-300 hover:bg-indigo-50 transition-all group"
+                  >
+                    <div className="w-16 h-16 rounded-full bg-indigo-100 flex items-center justify-center text-indigo-600 mb-3 group-hover:scale-110 transition-transform">
+                      <UserIcon size={32} />
+                    </div>
+                    <span className="font-semibold text-lg">{user.name}</span>
+                  </button>
+                ))}
+              </div>
+            ) : (
+              <div className="text-center animate-in fade-in slide-in-from-right-4">
+                <button 
+                  onClick={() => setLoginStep('select')}
+                  className="text-slate-400 hover:text-slate-600 mb-4 text-sm font-medium flex items-center justify-center w-full"
+                >
+                  &larr; Kembali
+                </button>
+                <div className="w-20 h-20 mx-auto rounded-full bg-indigo-100 flex items-center justify-center text-indigo-600 mb-4">
+                  <Lock size={32} />
+                </div>
+                <h2 className="text-xl font-bold mb-6">Masuk sebagai {users[selectedUserId].name}</h2>
+                
+                <form onSubmit={handlePinSubmit} className="max-w-xs mx-auto">
+                  <input
+                    type="password"
+                    value={pinInput}
+                    onChange={(e) => setPinInput(e.target.value)}
+                    placeholder="Masukkan Password"
+                    className="w-full text-center text-xl tracking-widest p-3 border-b-2 border-slate-300 focus:border-indigo-600 outline-none bg-transparent mb-2"
+                    autoFocus
+                  />
+                  {loginError && <p className="text-red-500 text-sm mb-4">{loginError}</p>}
+                  
+                  <button 
+                    type="submit"
+                    className="w-full bg-indigo-600 text-white font-semibold py-3 rounded-xl hover:bg-indigo-700 mt-4"
+                  >
+                    Masuk
+                  </button>
+                </form>
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="min-h-screen bg-slate-50 flex font-sans text-slate-800 overflow-hidden">
+      
+      {/* Sidebar Navigation */}
+      <div 
+        className={`${isSidebarOpen ? 'w-64 translate-x-0' : 'w-0 -translate-x-full'} 
+          hidden md:flex flex-col bg-indigo-900 text-white transition-all duration-300 ease-in-out z-20`}
+      >
+        <div className="p-6">
+          <h1 className="text-2xl font-bold whitespace-nowrap overflow-hidden">ChecklistKu</h1>
+          <p className="text-indigo-200 text-sm mt-1">Halo, {users[currentUser].name}</p>
+        </div>
+        <nav className="flex-1 px-4 space-y-2 mt-4">
+          <NavItem active={activeTab === 'today'} onClick={() => setActiveTab('today')} icon={<CheckCircle2 size={20} />} label="Hari Ini" />
+          <NavItem active={activeTab === 'routines'} onClick={() => setActiveTab('routines')} icon={<RotateCcw size={20} />} label="Rutinitas" />
+          <NavItem active={activeTab === 'history'} onClick={() => setActiveTab('history')} icon={<List size={20} />} label="Riwayat" />
+          <div className="my-4 border-t border-indigo-800"></div>
+          <NavItem active={activeTab === 'settings'} onClick={() => setActiveTab('settings')} icon={<Settings size={20} />} label="Pengaturan" />
+        </nav>
+        <div className="p-4">
+          <button 
+            onClick={handleLogout}
+            className="w-full py-2 px-4 bg-indigo-800 hover:bg-red-600 text-white rounded-lg transition-colors text-sm font-medium"
+          >
+            Keluar Akun
+          </button>
+        </div>
+      </div>
+
+      {/* Main Content Area */}
+      <div className="flex-1 flex flex-col h-screen overflow-hidden relative">
+        
+        {/* Header */}
+        <header className="bg-white border-b px-4 py-4 flex items-center justify-between z-10 shadow-sm shrink-0">
+          <div className="flex items-center">
+            <button 
+              onClick={() => setIsSidebarOpen(!isSidebarOpen)}
+              className="hidden md:block p-2 -ml-2 mr-2 text-slate-400 hover:text-indigo-600 hover:bg-slate-100 rounded-lg transition-colors"
+            >
+              <Menu size={24} />
+            </button>
+            <h1 className="text-xl font-bold text-slate-800 md:hidden">ChecklistKu</h1>
+            <h2 className="text-xl font-bold text-slate-800 hidden md:block">
+              {activeTab === 'today' && 'Tugas Hari Ini'}
+              {activeTab === 'routines' && 'Semua Rutinitas'}
+              {activeTab === 'history' && 'Riwayat Selesai'}
+              {activeTab === 'settings' && 'Pengaturan Akun'}
+            </h2>
+          </div>
+          
+          <div className="md:hidden flex items-center gap-2">
+             <span className="bg-indigo-100 text-indigo-800 px-3 py-1 rounded-full text-sm font-medium">
+               {users[currentUser].name}
+             </span>
+             <button onClick={handleLogout} className="p-2 text-red-500 hover:bg-red-50 rounded-full">
+               <X size={20} />
+             </button>
+          </div>
+        </header>
+
+        {/* Content Scrollable Area */}
+        <main className="flex-1 overflow-y-auto p-4 md:p-6 pb-24 md:pb-6 relative">
+          <div className={`mx-auto transition-all duration-300 ${isSidebarOpen ? 'max-w-3xl' : 'max-w-4xl'}`}>
+            
+            {activeTab === 'history' ? (
+              <div className="space-y-4">
+                <h3 className="font-semibold text-slate-500 uppercase text-sm tracking-wider mb-4 md:hidden">Riwayat Selesai</h3>
+                {userHistory.length === 0 ? (
+                  <div className="text-center py-10 text-slate-400">Belum ada tugas yang diselesaikan.</div>
+                ) : (
+                  userHistory.map(task => (
+                    <div key={task.historyId} className="bg-white p-4 rounded-xl border flex items-center gap-4 opacity-75">
+                      <div className="text-green-500"><CheckCircle2 size={24} /></div>
+                      <div className="flex-1">
+                        <p className="font-medium line-through">{task.title}</p>
+                        <p className="text-xs text-slate-400">
+                          Selesai pada: {new Date(task.completedAt).toLocaleTimeString('id-ID', {hour: '2-digit', minute:'2-digit'})}
+                        </p>
+                      </div>
+                      <span className={`text-xs px-2 py-1 rounded-md font-medium border ${PRIORITIES[task.priority].color}`}>
+                        {PRIORITIES[task.priority].label}
+                      </span>
+                    </div>
+                  ))
+                )}
+              </div>
+            ) : activeTab === 'settings' ? (
+               <div className="max-w-md mx-auto bg-white p-6 rounded-2xl shadow-sm border">
+                 <h2 className="text-xl font-bold mb-6 flex items-center gap-2">
+                   <Settings className="text-indigo-600" /> Pengaturan Profil
+                 </h2>
+                 
+                 {settingsMessage && (
+                   <div className="mb-4 p-3 bg-green-50 text-green-700 rounded-lg text-sm border border-green-200 flex items-center gap-2">
+                     <Check size={16} /> {settingsMessage}
+                   </div>
+                 )}
+
+                 <div className="space-y-4">
+                   <div>
+                     <label className="block text-sm font-medium text-slate-600 mb-1">Nama Akun</label>
+                     <input 
+                       type="text" 
+                       value={editName}
+                       onChange={(e) => setEditName(e.target.value)}
+                       className="w-full border rounded-xl p-3 focus:ring-2 focus:ring-indigo-200 outline-none"
+                     />
+                   </div>
+                   <div>
+                     <label className="block text-sm font-medium text-slate-600 mb-1">Password</label>
+                     <input 
+                       type="text" 
+                       value={editPin}
+                       onChange={(e) => setEditPin(e.target.value)}
+                       className="w-full border rounded-xl p-3 focus:ring-2 focus:ring-indigo-200 outline-none"
+                       placeholder="Masukkan Password"
+                     />
+                     <p className="text-xs text-slate-500 mt-1">Bisa berupa huruf, angka, atau kombinasi.</p>
+                   </div>
+                   
+                   <button 
+                     onClick={handleSaveSettings}
+                     className="w-full bg-indigo-600 text-white font-semibold py-3 rounded-xl hover:bg-indigo-700 mt-2"
+                   >
+                     Simpan Perubahan
+                   </button>
+                 </div>
+               </div>
+            ) : (
+              <div className="space-y-3">
+                <h3 className="font-semibold text-slate-500 uppercase text-sm tracking-wider mb-4 md:hidden">
+                  {activeTab === 'today' ? 'Hari Ini' : 'Semua Rutinitas'}
+                </h3>
+                {getFilteredTasks().length === 0 ? (
+                  <div className="text-center py-10 text-slate-400">
+                    <p>Hore! Tidak ada tugas di sini.</p>
+                    <p className="text-sm mt-1">Klik tombol tambah untuk membuat baru.</p>
+                  </div>
+                ) : (
+                  getFilteredTasks().map(task => (
+                    <div key={task.id} className={`bg-white p-4 rounded-xl shadow-sm border flex items-center gap-4 transition-all ${task.isCompleted ? 'bg-slate-50 opacity-60' : ''}`}>
+                      <button 
+                        onClick={() => toggleTaskCompletion(task.id, task.isCompleted)}
+                        className={`shrink-0 ${task.isCompleted ? 'text-green-500' : 'text-slate-300 hover:text-indigo-400'}`}
+                      >
+                        {task.isCompleted ? <CheckCircle2 size={28} /> : <Circle size={28} />}
+                      </button>
+                      <div className="flex-1 min-w-0">
+                        <p className={`font-medium truncate ${task.isCompleted ? 'line-through text-slate-500' : 'text-slate-800'}`}>
+                          {task.title}
+                        </p>
+                        <div className="flex items-center gap-2 mt-1">
+                          <span className={`text-[10px] px-2 py-0.5 rounded-full font-medium border ${PRIORITIES[task.priority].color}`}>
+                            {PRIORITIES[task.priority].label}
+                          </span>
+                          {task.type === 'routine' && (
+                            <span className="text-[10px] px-2 py-0.5 rounded-full font-medium bg-purple-100 text-purple-800 border border-purple-200 flex items-center gap-1">
+                              <RotateCcw size={10} /> Rutinitas
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  ))
+                )}
+              </div>
+            )}
+          </div>
+        </main>
+
+        {(activeTab === 'today' || activeTab === 'routines') && (
+          <div className="absolute bottom-20 md:bottom-8 right-4 md:right-8 z-30">
+             <button 
+                onClick={() => setIsAdding(true)}
+                className="bg-indigo-600 text-white p-4 rounded-full shadow-lg hover:bg-indigo-700 hover:scale-105 transition-all focus:outline-none focus:ring-4 focus:ring-indigo-200"
+              >
+                <Plus size={28} />
+              </button>
+          </div>
+        )}
+
+        {/* Modal Tambah */}
+        {isAdding && (
+          <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-sm flex items-end md:items-center justify-center z-50 p-4">
+            <div className="bg-white w-full max-w-md rounded-3xl md:rounded-2xl p-6 shadow-2xl animate-in slide-in-from-bottom-8 md:slide-in-from-bottom-4">
+              <div className="flex justify-between items-center mb-6">
+                <h3 className="text-xl font-bold text-slate-800">Tambah Baru</h3>
+                <button onClick={() => setIsAdding(false)} className="text-slate-400 hover:text-slate-600 bg-slate-100 p-2 rounded-full">
+                  <X size={20} />
+                </button>
+              </div>
+
+              <div className="space-y-5">
+                <div className="flex p-1 bg-slate-100 rounded-xl">
+                  <button 
+                    className={`flex-1 py-2 text-sm font-medium rounded-lg transition-colors ${newTaskType === 'task' ? 'bg-white shadow text-indigo-700' : 'text-slate-500'}`}
+                    onClick={() => setNewTaskType('task')}
+                  >Tugas Spesifik</button>
+                  <button 
+                    className={`flex-1 py-2 text-sm font-medium rounded-lg transition-colors ${newTaskType === 'routine' ? 'bg-white shadow text-indigo-700' : 'text-slate-500'}`}
+                    onClick={() => setNewTaskType('routine')}
+                  >Rutinitas</button>
+                </div>
+
+                <div>
+                  <label className="block text-sm font-medium text-slate-600 mb-1">Nama {newTaskType === 'task' ? 'Tugas' : 'Rutinitas'}</label>
+                  <input 
+                    type="text" 
+                    value={newTaskTitle}
+                    onChange={(e) => setNewTaskTitle(e.target.value)}
+                    placeholder="Contoh: Beli susu"
+                    className="w-full border-2 border-slate-200 rounded-xl p-3 focus:border-indigo-500 outline-none transition-colors"
+                    autoFocus
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-sm font-medium text-slate-600 mb-2">Prioritas</label>
+                  <div className="grid grid-cols-2 gap-2">
+                    {Object.entries(PRIORITIES).map(([key, val]) => (
+                      <button
+                        key={key}
+                        onClick={() => setNewTaskPriority(key)}
+                        className={`py-2 text-sm font-medium rounded-xl border-2 transition-all ${
+                          newTaskPriority === key ? val.color + ' ring-2 ring-offset-1 ring-' + val.color.split('-')[1] + '-400' : 'bg-slate-50 border-transparent text-slate-600 hover:bg-slate-100'
+                        }`}
+                      >
+                        {val.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {newTaskType === 'routine' && (
+                  <div>
+                    <label className="block text-sm font-medium text-slate-600 mb-2">Aktif pada hari:</label>
+                    <div className="flex gap-1 justify-between mb-2">
+                      {['Sn', 'Sl', 'Rb', 'Km', 'Jm', 'Sb', 'Mg'].map((day, idx) => (
+                        <button
+                          key={idx}
+                          onClick={() => {
+                            if (newTaskDays.includes(idx)) setNewTaskDays(newTaskDays.filter(d => d !== idx));
+                            else setNewTaskDays([...newTaskDays, idx]);
+                          }}
+                          className={`w-10 h-10 rounded-full text-sm font-medium flex items-center justify-center transition-colors ${
+                            newTaskDays.includes(idx) ? 'bg-indigo-600 text-white' : 'bg-slate-100 text-slate-500 hover:bg-slate-200'
+                          }`}
+                        >
+                          {day}
+                        </button>
+                      ))}
+                    </div>
+                    <div className="flex gap-2">
+                      <button onClick={() => setNewTaskDays([0,1,2,3,4])} className="text-xs bg-slate-100 px-3 py-1.5 rounded-lg text-slate-600 hover:bg-slate-200">Senin-Jumat</button>
+                      <button onClick={() => setNewTaskDays([5,6])} className="text-xs bg-slate-100 px-3 py-1.5 rounded-lg text-slate-600 hover:bg-slate-200">Sabtu-Minggu</button>
+                      <button onClick={() => setNewTaskDays([0,1,2,3,4,5,6])} className="text-xs bg-slate-100 px-3 py-1.5 rounded-lg text-slate-600 hover:bg-slate-200">Tiap Hari</button>
+                    </div>
+                  </div>
+                )}
+
+                <button 
+                  onClick={handleAddTask}
+                  disabled={!newTaskTitle.trim()}
+                  className="w-full bg-indigo-600 text-white font-bold py-3.5 rounded-xl hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed mt-2"
+                >
+                  Simpan
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        <nav className="md:hidden bg-white border-t flex justify-around p-2 shrink-0 pb-safe z-20">
+          <MobileNavButton active={activeTab === 'today'} onClick={() => setActiveTab('today')} icon={<CheckCircle2 size={24} />} label="Hari Ini" />
+          <MobileNavButton active={activeTab === 'routines'} onClick={() => setActiveTab('routines')} icon={<RotateCcw size={24} />} label="Rutinitas" />
+          <MobileNavButton active={activeTab === 'history'} onClick={() => setActiveTab('history')} icon={<List size={24} />} label="Riwayat" />
+          <MobileNavButton active={activeTab === 'settings'} onClick={() => setActiveTab('settings')} icon={<Settings size={24} />} label="Pengaturan" />
+        </nav>
+      </div>
+    </div>
+  );
+}
+
+function NavItem({ active, icon, label, onClick }) {
+  return (
+    <button 
+      onClick={onClick}
+      className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl transition-colors font-medium text-sm ${
+        active ? 'bg-indigo-800 text-white' : 'text-indigo-200 hover:bg-indigo-800/50 hover:text-white'
+      }`}
+    >
+      {icon} {label}
+    </button>
+  );
+}
+
+function MobileNavButton({ active, icon, label, onClick }) {
+  return (
+    <button 
+      onClick={onClick}
+      className={`flex flex-col items-center p-2 min-w-[70px] ${
+        active ? 'text-indigo-600' : 'text-slate-400 hover:text-slate-600'
+      }`}
+    >
+      <div className={`mb-1 transition-transform ${active ? 'scale-110' : ''}`}>
+        {icon}
+      </div>
+      <span className="text-[10px] font-medium">{label}</span>
+    </button>
+  );
+}
